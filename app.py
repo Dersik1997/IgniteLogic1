@@ -1,103 +1,94 @@
 import streamlit as st
-import paho.mqtt.client as mqtt
-import pickle
+import pandas as pd
+import numpy as np
+import joblib
+import json
 import time
+from paho.mqtt import client as mqtt_client
+from streamlit_autorefresh import st_autorefresh
 
-# ===========================
+# --------------------------------------------
 # LOAD MODEL
-# ===========================
-model = pickle.load(open("model.pkl", "rb"))
+# --------------------------------------------
+model = joblib.load("model.pkl")
 
-# ===========================
+# --------------------------------------------
 # MQTT CONFIG
-# ===========================
-MQTT_BROKER = "broker.emqx.io"
-SENSOR_TOPIC = "Iot/IgniteLogic/sensor"
-OUTPUT_TOPIC = "Iot/IgniteLogic/output"
+# --------------------------------------------
+BROKER = "broker.emqx.io"
+PORT = 1883
+TOPIC_SENSOR = "Iot/IgniteLogic/sensor"
+TOPIC_OUTPUT = "Iot/IgniteLogic/output"
+CLIENT_ID = "streamlit-dashboard-001"
 
-latest_sensor_data = {"temperature": None, "humidity": None, "light": None}
-latest_output = None
+latest_sensor = {"temp": None, "hum": None, "light": None, "label": "-"}
 
-# ===========================
-# MQTT CALLBACKS
-# ===========================
-def on_connect(client, userdata, flags, rc):
-    client.subscribe(SENSOR_TOPIC)
-    client.subscribe(OUTPUT_TOPIC)
-
+# --------------------------------------------
+# MQTT CALLBACK HANDLING
+# --------------------------------------------
 def on_message(client, userdata, msg):
-    global latest_sensor_data, latest_output
+    global latest_sensor
+    try:
+        data = json.loads(msg.payload.decode())
+        latest_sensor.update(data)
+    except:
+        pass
 
-    payload = msg.payload.decode()
-    topic = msg.topic
+def connect_mqtt():
+    client = mqtt_client.Client(CLIENT_ID)
+    client.on_message = on_message
+    client.connect(BROKER, PORT)
+    client.subscribe(TOPIC_SENSOR)
+    return client
 
-    if topic == SENSOR_TOPIC:
-        try:
-            t, h, l = payload.split(",")
-            latest_sensor_data["temperature"] = float(t)
-            latest_sensor_data["humidity"] = float(h)
-            latest_sensor_data["light"] = float(l)
-        except:
-            pass
-
-    if topic == OUTPUT_TOPIC:
-        latest_output = payload
-
-client = mqtt.Client()
-client.on_connect = on_connect
-client.on_message = on_message
-client.connect(MQTT_BROKER, 1883)
+client = connect_mqtt()
 client.loop_start()
 
-# ===========================
+# --------------------------------------------
 # STREAMLIT UI
-# ===========================
-st.title("🔥 IoT + Machine Learning Dashboard")
-st.write("Real-time monitoring menggunakan ESP32 + MQTT + ML")
+# --------------------------------------------
+st.set_page_config(page_title="IgniteLogic Dashboard", layout="centered")
 
-sensor_box = st.empty()
-prediction_box = st.empty()
-output_box = st.empty()
+st.title("🔥 IgniteLogic - IoT + Machine Learning Dashboard")
 
-# ===========================
-# LOOP TAMPILKAN DATA
-# ===========================
-while True:
-    t = latest_sensor_data["temperature"]
-    h = latest_sensor_data["humidity"]
-    l = latest_sensor_data["light"]
+# auto-refresh setiap 2 detik
+st_autorefresh(interval=2000, key="datastream")
 
-    # ========== TAMPILKAN SENSOR ==========
-    if t is not None:
-        sensor_box.info(
-            f"""
-            **Sensor Data (ESP32):**  
-            🔥 Suhu: `{t}`  
-            💧 Lembap: `{h}`  
-            💡 Cahaya: `{l}`  
-            """
-        )
+st.subheader("📡 Data Sensor Terbaru")
 
-        # ========== ML PREDIKSI ==========
-        input_data = [[t, h, l]]
-        pred = model.predict(input_data)[0]
+temp = latest_sensor.get("temp")
+hum = latest_sensor.get("hum")
+light = latest_sensor.get("light")
 
-        # ========== ALERT WARNA ==========
-        if pred == "Aman":
-            prediction_box.success("🟢 Status: AMAN")
-        else:
-            prediction_box.error("🔴 Status: TIDAK AMAN")
+col1, col2, col3 = st.columns(3)
+col1.metric("Temperature (°C)", temp)
+col2.metric("Humidity (%)", hum)
+col3.metric("Light", light)
 
+# --------------------------------------------
+# ML PREDICTION
+# --------------------------------------------
+if temp is not None and hum is not None and light is not None:
+
+    input_data = np.array([[temp, hum, light]])
+    pred = model.predict(input_data)[0]
+
+    st.subheader("🤖 ML Prediction Output")
+
+    if pred == "Aman":
+        st.success("🟢 AMAN")
+        color = "Green"
     else:
-        sensor_box.warning("Menunggu data dari ESP32...")
+        st.error("🔴 TIDAK AMAN")
+        color = "Red"
 
-    # ========== OUTPUT TOPIC STATUS ==========
-    if latest_output is not None:
-        if latest_output == "Aman":
-            output_box.success("🟢 Lampu Aman (Hijau)")
-        else:
-            output_box.error("🔴 Lampu Tidak Aman (Merah)")
-    else:
-        output_box.info("Menunggu data output dari ESP32...")
+    # Publish prediction ke ESP32
+    client.publish(TOPIC_OUTPUT, pred)
 
-    time.sleep(0.5)
+    st.write(f"Prediction sent to ESP32 → **{pred}**")
+
+else:
+    st.warning("Menunggu data dari ESP32...")
+
+st.write("---")
+st.caption("Connected to EMQX MQTT Broker")
