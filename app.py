@@ -1,206 +1,103 @@
-# app.py - IoT ML Realtime Dashboard
-
 import streamlit as st
-import pandas as pd
-import numpy as np
-import json
-import time
-import queue
-import threading
-from datetime import datetime, timezone, timedelta
-import plotly.graph_objs as go
 import paho.mqtt.client as mqtt
-import joblib
+import pickle
+import time
 
-# --------------------------------
-# CONFIGURATIONS
-# --------------------------------
+# ===========================
+# LOAD MODEL
+# ===========================
+model = pickle.load(open("model.pkl", "rb"))
+
+# ===========================
+# MQTT CONFIG
+# ===========================
 MQTT_BROKER = "broker.emqx.io"
-MQTT_PORT = 1883
-TOPIC_SENSOR = "Iot/IgniteLogic/sensor"
-TOPIC_OUTPUT = "Iot/IgniteLogic/output"
-MODEL_PATH = "model.pkl"
+SENSOR_TOPIC = "Iot/IgniteLogic/sensor"
+OUTPUT_TOPIC = "Iot/IgniteLogic/output"
 
-TZ = timezone(timedelta(hours=7))
-def now_str():
-    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+latest_sensor_data = {"temperature": None, "humidity": None, "light": None}
+latest_output = None
 
-GLOBAL_MQ = queue.Queue()
-
-st.set_page_config(page_title="IgniteLogic ML Dashboard", layout="wide")
-st.title("🔥 IgniteLogic IoT + Machine Learning Dashboard")
-
-# --------------------------------
-# SESSION STATE
-# --------------------------------
-if "logs" not in st.session_state:
-    st.session_state.logs = []
-
-if "last" not in st.session_state:
-    st.session_state.last = None
-
-if "mqtt_thread_started" not in st.session_state:
-    st.session_state.mqtt_thread_started = False
-
-if "ml_model" not in st.session_state:
-    st.session_state.ml_model = joblib.load(MODEL_PATH)
-
-
-# --------------------------------
+# ===========================
 # MQTT CALLBACKS
-# --------------------------------
-def _on_connect(client, userdata, flags, rc):
-    client.subscribe(TOPIC_SENSOR)
-    GLOBAL_MQ.put({"_type": "status", "connected": (rc == 0)})
+# ===========================
+def on_connect(client, userdata, flags, rc):
+    client.subscribe(SENSOR_TOPIC)
+    client.subscribe(OUTPUT_TOPIC)
 
-def _on_message(client, userdata, msg):
-    try:
-        payload = json.loads(msg.payload.decode())
-        GLOBAL_MQ.put({"_type": "sensor", "data": payload})
-    except:
-        pass
+def on_message(client, userdata, msg):
+    global latest_sensor_data, latest_output
 
+    payload = msg.payload.decode()
+    topic = msg.topic
 
-# --------------------------------
-# MQTT THREAD
-# --------------------------------
-def start_mqtt_thread_once():
-    def worker():
-        client = mqtt.Client()
-        client.on_connect = _on_connect
-        client.on_message = _on_message
-
-        while True:
-            try:
-                client.connect(MQTT_BROKER, MQTT_PORT, 60)
-                client.loop_forever()
-            except Exception as e:
-                GLOBAL_MQ.put({"_type": "error", "msg": str(e)})
-                time.sleep(3)
-
-    if not st.session_state.mqtt_thread_started:
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
-        st.session_state.mqtt_thread_started = True
-
-start_mqtt_thread_once()
-
-
-# --------------------------------
-# ML PREDICT HELPER
-# --------------------------------
-def predict_status(light, temp, hum):
-    model = st.session_state.ml_model
-    X = [[light, temp, hum]]
-
-    try:
-        label = model.predict(X)[0]
-    except:
-        label = "ERR"
-
-    if hasattr(model, "predict_proba"):
+    if topic == SENSOR_TOPIC:
         try:
-            conf = float(np.max(model.predict_proba(X)))
+            t, h, l = payload.split(",")
+            latest_sensor_data["temperature"] = float(t)
+            latest_sensor_data["humidity"] = float(h)
+            latest_sensor_data["light"] = float(l)
         except:
-            conf = None
-    else:
-        conf = None
+            pass
 
-    return label, conf
+    if topic == OUTPUT_TOPIC:
+        latest_output = payload
 
+client = mqtt.Client()
+client.on_connect = on_connect
+client.on_message = on_message
+client.connect(MQTT_BROKER, 1883)
+client.loop_start()
 
-# --------------------------------
-# PROCESS QUEUE
-# --------------------------------
-def process_queue():
-    q = GLOBAL_MQ
+# ===========================
+# STREAMLIT UI
+# ===========================
+st.title("🔥 IoT + Machine Learning Dashboard")
+st.write("Real-time monitoring menggunakan ESP32 + MQTT + ML")
 
-    while not q.empty():
-        item = q.get()
-        t = now_str()
+sensor_box = st.empty()
+prediction_box = st.empty()
+output_box = st.empty()
 
-        if item["_type"] == "sensor":
-            d = item["data"]
+# ===========================
+# LOOP TAMPILKAN DATA
+# ===========================
+while True:
+    t = latest_sensor_data["temperature"]
+    h = latest_sensor_data["humidity"]
+    l = latest_sensor_data["light"]
 
-            light = float(d.get("light", 0))
-            temp = float(d.get("temperature", 0))
-            hum = float(d.get("humidity", 0))
+    # ========== TAMPILKAN SENSOR ==========
+    if t is not None:
+        sensor_box.info(
+            f"""
+            **Sensor Data (ESP32):**  
+            🔥 Suhu: `{t}`  
+            💧 Lembap: `{h}`  
+            💡 Cahaya: `{l}`  
+            """
+        )
 
-            # ML Prediction
-            pred, conf = predict_status(light, temp, hum)
+        # ========== ML PREDIKSI ==========
+        input_data = [[t, h, l]]
+        pred = model.predict(input_data)[0]
 
-            # Publish output to ESP32
-            out_msg = "AMAN" if pred == "Aman" else "TIDAK_AMAN"
-            try:
-                pub = mqtt.Client()
-                pub.connect(MQTT_BROKER, MQTT_PORT, 60)
-                pub.publish(TOPIC_OUTPUT, out_msg)
-                pub.disconnect()
-            except:
-                pass
-
-            row = {
-                "ts": t,
-                "light": light,
-                "temp": temp,
-                "hum": hum,
-                "pred": pred,
-                "conf": conf,
-            }
-
-            st.session_state.last = row
-            st.session_state.logs.append(row)
-
-            # Limit logs to 2000
-            if len(st.session_state.logs) > 2000:
-                st.session_state.logs = st.session_state.logs[-2000:]
-
-process_queue()
-
-
-# --------------------------------
-# UI SECTION
-# --------------------------------
-left, right = st.columns([1, 2])
-
-# LEFT PANEL
-with left:
-    st.header("📡 Last Sensor Reading")
-
-    if st.session_state.last:
-        last = st.session_state.last
-
-        st.write(f"⏱ Time: {last['ts']}")
-        st.write(f"💡 Light: {last['light']}")
-        st.write(f"🌡 Temperature: {last['temp']} °C")
-        st.write(f"💧 Humidity: {last['hum']} %")
-
-        st.markdown("---")
-        st.subheader("ML Prediction")
-
-        if last["pred"] == "Aman":
-            st.success(f"🟢 Status: {last['pred']}")
+        # ========== ALERT WARNA ==========
+        if pred == "Aman":
+            prediction_box.success("🟢 Status: AMAN")
         else:
-            st.error(f"🔴 Status: {last['pred']}")
+            prediction_box.error("🔴 Status: TIDAK AMAN")
 
-        st.write(f"Confidence: {last['conf']}")
     else:
-        st.info("Menunggu data dari ESP32...")
+        sensor_box.warning("Menunggu data dari ESP32...")
 
-# RIGHT PANEL
-with right:
-    st.header("📊 Live Chart")
+    # ========== OUTPUT TOPIC STATUS ==========
+    if latest_output is not None:
+        if latest_output == "Aman":
+            output_box.success("🟢 Lampu Aman (Hijau)")
+        else:
+            output_box.error("🔴 Lampu Tidak Aman (Merah)")
+    else:
+        output_box.info("Menunggu data output dari ESP32...")
 
-    df = pd.DataFrame(st.session_state.logs[-200:])
-
-    if not df.empty:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df["ts"], y=df["temp"], mode="lines", name="Temp"))
-        fig.add_trace(go.Scatter(x=df["ts"], y=df["hum"], mode="lines", name="Humidity"))
-        fig.add_trace(go.Scatter(x=df["ts"], y=df["light"], mode="lines", name="Light"))
-
-        st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("Recent Logs")
-    if not df.empty:
-        st.dataframe(df[::-1])
+    time.sleep(0.5)
