@@ -1,8 +1,7 @@
-streamlit>=1.25.0
+streamlit
+paho-mqtt
+scikit-learn
 pandas
 numpy
-joblib
-scikit-learn
-plotly
-paho-mqtt
-streamlit-autorefresh
+
+
